@@ -1,0 +1,190 @@
+# Builds demoparser2 wheels from any ref of this fork and attaches them to a
+# GitHub release, so downstream projects can install a patched build while
+# the matching change waits on upstream. Deliberately separate from
+# deploy.yml, which publishes to PyPI and needs a token this fork does not
+# have; this workflow never touches PyPI.
+#
+# The release is tagged medal-<version> at the resolved commit. Give the
+# wheels a local version (0.42.1+medal.1) so they can never be mistaken for,
+# or shadowed by, the PyPI build of the same upstream version.
+name: Release wheels
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version stamped into the wheels, e.g. 0.42.1+medal.1 (tagged medal-<version>)"
+        required: true
+        type: string
+      ref:
+        description: "Branch, tag or commit to build; resolved to one commit before any build starts"
+        required: true
+        default: python-315
+        type: string
+      python-versions:
+        description: "JSON list of CPython versions to build wheels for"
+        required: true
+        default: '["3.15"]'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve ref and check tag
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Validate version
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\+[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::version must look like 0.42.1 or 0.42.1+medal.1, got '$VERSION'"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Resolve ref to a commit
+        id: resolve
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "Building ${{ inputs.ref }} at $sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "tag=medal-$VERSION" >> "$GITHUB_OUTPUT"
+
+      # Published wheels are pinned by hash downstream, so never replace them
+      # under an existing tag: pick a new version instead.
+      - name: Refuse to overwrite an existing release
+        run: |
+          if gh release view "medal-$VERSION" >/dev/null 2>&1; then
+            echo "::error::release medal-$VERSION already exists; bump the local version suffix"
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.platform.os }} ${{ matrix.platform.target }} py${{ matrix.python-version }}
+    needs: resolve
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+        platform:
+          # What runs in production (GKE n2d nodes and Cloud Run) is x86_64
+          # Linux; the macOS wheels are for developer machines.
+          - { os: ubuntu-latest, target: x86_64 }
+          - { os: macos-latest, target: aarch64 }
+          - { os: macos-latest, target: x86_64 }
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # Refs that compile Valve's protobufs with protox ignore this; refs that
+      # still shell out to protoc (upstream main as of #369) need it. The
+      # Linux build runs inside maturin's manylinux container, so it gets
+      # protoc through before-script-linux below instead.
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3.0.0
+        with:
+          version: "23.x"
+          repo-token: ${{ github.token }}
+
+      # Cargo.toml is the single source of the version maturin stamps into
+      # the wheel, and cargo accepts semver build metadata (+medal.1), which
+      # maturin carries over as a PEP 440 local version. Only the first
+      # `version =` line is the package's own; the rest are dependencies.
+      - name: Stamp version into the Python crate
+        run: |
+          perl -pi -e 'if (!$done && s/^version = "[^"]*"/version = "$ENV{VERSION}"/) { $done = 1 }' src/python/Cargo.toml
+          grep -m1 '^version = ' src/python/Cargo.toml
+
+      - name: Build wheel
+        uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
+        with:
+          command: build
+          target: ${{ matrix.platform.target }}
+          args: --release --out dist -i ${{ matrix.python-version }} ${{ runner.os == 'Linux' && '--no-default-features' || '' }} -m src/python/Cargo.toml
+          before-script-linux: |
+            # NOTE: rust-cross/manylinux docker images are CentOS based
+            yum install -y wget unzip
+            wget https://github.com/protocolbuffers/protobuf/releases/download/v23.4/protoc-23.4-linux-x86_64.zip
+            unzip protoc-23.4-linux-x86_64.zip -d $HOME/protoc
+            mv $HOME/protoc/bin/protoc /usr/local/bin/
+            cp -r $HOME/protoc/include/* /usr/local/include/
+            chmod 755 /usr/local/bin/protoc
+            protoc --version
+
+      - name: List wheels
+        run: ls -l dist
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}-py${{ matrix.python-version }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ inputs.version }}
+      REF: ${{ inputs.ref }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create release with wheels
+        run: |
+          ls -l dist
+          {
+            echo "demoparser2 $VERSION built from \`$REF\` at $SHA."
+            echo
+            echo "Wheels built by this fork while the change waits on upstream; not published to PyPI."
+            echo "Install by direct URL, e.g. in \`[tool.uv.sources]\`:"
+            echo
+            echo '```'
+            for whl in dist/*.whl; do
+              echo "https://github.com/$GH_REPO/releases/download/$TAG/$(basename "$whl")"
+            done
+            echo '```'
+          } > notes.md
+          gh release create "$TAG" \
+            --target "$SHA" \
+            --title "demoparser2 $VERSION" \
+            --notes-file notes.md \
+            dist/*.whl
